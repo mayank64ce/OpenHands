@@ -1,4 +1,7 @@
-from openhands.runtime.e2b.sandbox import E2BBox
+try:
+    from openhands.runtime.e2b.sandbox import E2BBox
+except ImportError:
+    E2BBox = None
 
 
 def get_runtime_cls(name: str):
@@ -15,6 +18,10 @@ def get_runtime_cls(name: str):
         from openhands.runtime.remote.runtime import RemoteRuntime
 
         return RemoteRuntime
+    elif name == 'local':
+        from openhands.runtime.local.runtime import LocalRuntime
+
+        return LocalRuntime
     else:
         raise ValueError(f'Runtime {name} not supported')
 

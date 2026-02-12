@@ -13,6 +13,7 @@ from agenthub import (  # noqa: E402
     codeact_swe_agent,
     delegator_agent,
     dummy_agent,
+    fhe_agent,
     planner_agent,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     'delegator_agent',
     'dummy_agent',
     'browsing_agent',
+    'fhe_agent',
 ]
 
 for agent in all_microagents.values():
