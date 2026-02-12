@@ -2,17 +2,17 @@
 """
 FHE Challenge Runner for OpenHands.
 
-Runs the FHE challenge solving loop:
+Runs the FHE challenge solving loop using OpenHands infrastructure:
 1. Parse challenge specification
 2. Create interpreter (handles Docker judge)
-3. Build system prompt with challenge context
-4. Loop: LLM generates code → inject → docker build/run → feedback → repeat
+3. Configure OpenHands LLM + FHEAgent
+4. Loop: agent.step(state) generates code → inject → docker build/run → feedback → repeat
 
-Uses litellm directly for LLM calls (compatible with Python 3.10+).
-OpenHands Agent/Runtime infrastructure is available but not required for this runner.
+Uses OpenHands' LLM class (retry logic, metrics, cost tracking) and FHEAgent
+(encapsulates prompt building, conversation history via EventStream).
 
 Usage:
-    python run_fhe.py \
+    conda run -n openhands python run_fhe.py \
         --model gpt-4o \
         --challenge-dir ../fhe_challenge/black_box/challenge_relu \
         --max-steps 30 \
@@ -25,21 +25,33 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from litellm import completion as litellm_completion
-
 # Add OpenHands to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from openhands.core.config import (
+    AppConfig,
+    LLMConfig,
+    AgentConfig,
+    load_from_toml,
+    load_from_env,
+    finalize_config,
+)
+from openhands.llm.llm import LLM
+from openhands.events.stream import EventStream
+from openhands.events.event import EventSource
+from openhands.events.action import MessageAction, AgentFinishAction
+from openhands.controller.state.state import State
+from openhands.storage.local import LocalFileStore
+
+from agenthub.fhe_agent.fhe_agent import FHEAgent, extract_code_from_response
 from fhe.challenge_parser import parse_challenge, FHEChallengeSpec, ChallengeType
-from fhe.interpreters import create_interpreter, ExecutionResult
-from openhands.core.config import AppConfig, load_from_toml, load_from_env, finalize_config
+from fhe.interpreters import create_interpreter
 
 logger = logging.getLogger("openhands.fhe.runner")
 
@@ -73,207 +85,6 @@ def parse_args():
                         help="Stop when accuracy reaches this threshold")
 
     return parser.parse_args()
-
-
-# ============================================================
-# Code extraction
-# ============================================================
-
-def extract_code_from_response(response: str) -> Optional[str]:
-    """Extract code from LLM response.
-
-    Handles:
-    1. ### CONFIG ### / ### CODE ### sections
-    2. ```cpp ... ``` code blocks
-    3. Generic ``` ... ``` blocks
-    4. Raw code heuristic
-    """
-    if "### CONFIG ###" in response or "### TRAINING CODE ###" in response:
-        for marker in ["### CONFIG ###", "### TRAINING CODE ###", "### INFERENCE CODE ###", "### CODE ###"]:
-            idx = response.find(marker)
-            if idx >= 0:
-                return response[idx:].strip()
-
-    for lang in ['cpp', 'c\\+\\+', 'python', 'swift']:
-        pattern = rf'```{lang}\s*\n(.*?)```'
-        match = re.search(pattern, response, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-
-    pattern = r'```\s*\n(.*?)```'
-    match = re.search(pattern, response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    lines = response.strip().split('\n')
-    code_indicators = sum(1 for l in lines if any(c in l for c in [';', '{', '}', 'auto ', 'int ', 'double ']))
-    if code_indicators > len(lines) * 0.3:
-        return response.strip()
-
-    return None
-
-
-# ============================================================
-# System prompt builder
-# ============================================================
-
-def build_system_prompt(spec: FHEChallengeSpec, template_code: dict[str, str]) -> str:
-    """Build system prompt with challenge context and template info."""
-    lines = [
-        "You are an expert FHE (Fully Homomorphic Encryption) programmer.",
-        "Your task is to implement the eval() function body for an FHE challenge.",
-        "",
-        "IMPORTANT RULES:",
-        "1. Output ONLY the eval() function BODY (not the full function definition).",
-        "2. Wrap your code in a ```cpp code block.",
-        "3. Use the exact variable names from the template (class member variables).",
-        "4. The eval() function is void - assign the result to the output variable, do NOT return.",
-        "5. Stay within the multiplicative depth budget.",
-        "6. Use only the rotation keys that are available.",
-        "",
-    ]
-
-    if spec:
-        lines.append("=== CHALLENGE SPECIFICATION ===")
-        lines.append(f"Task: {spec.task}")
-        if spec.task_description:
-            lines.append(f"Description: {spec.task_description}")
-        if spec.function_signature:
-            lines.append(f"Function: {spec.function_signature}")
-        lines.append(f"Scheme: {spec.scheme.value if spec.scheme else 'CKKS'}")
-        lines.append(f"Library: {spec.library.value if spec.library else 'OpenFHE'}")
-        lines.append(f"Challenge Type: {spec.challenge_type.value}")
-        lines.append("")
-
-        if spec.constraints:
-            lines.append("Constraints:")
-            lines.append(f"  Multiplicative Depth: {spec.constraints.depth}")
-            lines.append(f"  Batch Size: {spec.constraints.batch_size}")
-            lines.append(f"  Input Range: [{spec.constraints.input_range[0]}, {spec.constraints.input_range[1]}]")
-            lines.append("")
-
-        if spec.keys:
-            lines.append("Available Keys:")
-            lines.append(f"  Public Key: {spec.keys.public}")
-            lines.append(f"  Multiplication Key: {spec.keys.multiplication}")
-            if spec.keys.rotation_indices:
-                lines.append(f"  Rotation Indices: {spec.keys.rotation_indices}")
-            lines.append(f"  Bootstrapping: {spec.keys.bootstrapping}")
-            lines.append("")
-
-        if spec.scoring:
-            lines.append("Scoring:")
-            lines.append(f"  Error Threshold: {spec.scoring.error_threshold}")
-            lines.append(f"  Accuracy Threshold: {spec.scoring.accuracy_threshold}")
-            lines.append("")
-
-        if spec.useful_links:
-            lines.append("Useful Resources:")
-            for link in spec.useful_links:
-                lines.append(f"  - {link['name']}: {link['url']}")
-            lines.append("")
-
-    # Add template code context
-    if template_code:
-        lines.append("=== TEMPLATE FILES ===")
-        for name, content in template_code.items():
-            if len(content) > 3000:
-                content = content[:2500] + "\n\n// ... (truncated) ...\n\n" + content[-500:]
-            lines.append(f"\n--- {name} ---")
-            lines.append(content)
-        lines.append("")
-
-        # Extract variable hints from header
-        lines.append("=== VARIABLE NAMES ===")
-        lines.extend(_extract_variable_hints(template_code))
-        lines.append("")
-
-    # Format-specific instructions
-    if spec and spec.challenge_type == ChallengeType.ML_INFERENCE:
-        lines.extend([
-            "=== ML INFERENCE FORMAT ===",
-            "For ML inference challenges, provide your code in this format:",
-            "",
-            "### TRAINING CODE ###",
-            "# Python training script (saves weights to workspace/weights/)",
-            "",
-            "### INFERENCE CODE ###",
-            "# C++ eval() body that loads weights and does encrypted inference",
-            "",
-        ])
-
-    if spec and spec.challenge_type == ChallengeType.WHITE_BOX_OPENFHE:
-        lines.extend([
-            "=== CONFIG FORMAT ===",
-            "For white box challenges, you may optionally provide a config.json:",
-            "",
-            "### CONFIG ###",
-            '{"mult_depth": 10, "scale_mod_size": 50, ...}',
-            "",
-            "### CODE ###",
-            "// Your eval() body here",
-            "",
-            "If no CONFIG section is provided, the template's default config.json is used.",
-            "",
-        ])
-
-    return "\n".join(lines)
-
-
-def _extract_variable_hints(template_code: dict[str, str]) -> list[str]:
-    """Extract variable names from template header files."""
-    lines = []
-
-    header = template_code.get("yourSolution.h", "")
-    if not header:
-        for name, content in template_code.items():
-            if name.endswith(".h"):
-                header = content
-                break
-
-    if header:
-        ct_vars = re.findall(r'Ciphertext<DCRTPoly>\s+(m_\w+)', header)
-        cc_match = re.search(r'CryptoContext<DCRTPoly>\s+(m_\w+)', header)
-        pk_match = re.search(r'PublicKey<DCRTPoly>\s+(m_\w+)', header)
-
-        inputs = [v for v in ct_vars if 'Output' not in v]
-        outputs = [v for v in ct_vars if 'Output' in v]
-
-        lines.append("Use these EXACT member variable names:")
-        if cc_match:
-            lines.append(f"  CryptoContext: {cc_match.group(1)}")
-        if inputs:
-            lines.append(f"  Input(s): {', '.join(inputs)}")
-        if outputs:
-            lines.append(f"  Output: {', '.join(outputs)} (assign to this, don't return)")
-        if pk_match:
-            lines.append(f"  PublicKey: {pk_match.group(1)}")
-
-    py_template = template_code.get("app.py", "")
-    if py_template:
-        solve_match = re.search(r'def\s+solve\s*\(([^)]*)\)', py_template)
-        if solve_match:
-            lines.append(f"solve() function signature: def solve({solve_match.group(1)})")
-            lines.append("Return the encrypted result from solve().")
-
-    return lines
-
-
-def get_initial_prompt(spec: FHEChallengeSpec) -> str:
-    """Get the initial user prompt."""
-    task = spec.task or "unknown"
-    scheme = spec.scheme.value if spec.scheme else "CKKS"
-    depth = spec.constraints.depth if spec.constraints else 10
-
-    return (
-        f"Implement the eval() function body for the '{task}' FHE challenge "
-        f"using the {scheme} encryption scheme.\n\n"
-        f"Remember:\n"
-        f"- Output ONLY the function body (not the full function definition)\n"
-        f"- Use the exact member variable names from the template\n"
-        f"- Stay within the multiplicative depth budget of {depth}\n"
-        f"- Wrap your code in a ```cpp code block\n"
-    )
 
 
 # ============================================================
@@ -448,34 +259,6 @@ def run_on_testcases(interpreter, code: str, testcase_dirs: list) -> AggregatedR
 
 
 # ============================================================
-# LLM wrapper
-# ============================================================
-
-def llm_call(
-    messages: list[dict],
-    model: str,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    temperature: float = 0.7,
-    max_tokens: int = 4096,
-) -> str:
-    """Call LLM via litellm and return response content."""
-    kwargs = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if api_key:
-        kwargs["api_key"] = api_key
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    response = litellm_completion(**kwargs)
-    return response['choices'][0]['message']['content']
-
-
-# ============================================================
 # Persistence
 # ============================================================
 
@@ -576,30 +359,51 @@ def main():
     )
     logger.info(f"Interpreter: {interpreter.__class__.__name__}")
 
-    # 4. Build prompts
-    template_code = read_templates(spec)
-    system_prompt = build_system_prompt(spec, template_code)
-    initial_prompt = get_initial_prompt(spec)
-
-    # 5. LLM config
+    # 4. Configure OpenHands
     app_config = AppConfig()
     config_path = Path(__file__).parent / "config.toml"
     if config_path.exists():
         load_from_toml(app_config, str(config_path))
     load_from_env(app_config, os.environ)
     finalize_config(app_config)
-    
+
+    # Override LLM config with CLI args
     llm_config = app_config.get_llm_config()
+    llm_config.model = args.model
+    if args.api_key:
+        llm_config.api_key = args.api_key
+    elif not llm_config.api_key:
+        # Fall back to common env vars
+        llm_config.api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    if args.base_url:
+        llm_config.base_url = args.base_url
+    llm_config.temperature = args.temperature
 
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or llm_config.api_key
-    base_url = args.base_url or llm_config.base_url
+    # 5. Create LLM + Agent
+    llm = LLM(config=llm_config)
+    agent_config = AgentConfig()
+    template_code = read_templates(spec)
+    agent = FHEAgent(
+        llm=llm,
+        config=agent_config,
+        challenge_spec=spec,
+        template_code=template_code,
+    )
 
-    # 6. Run the loop
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": initial_prompt},
-    ]
+    # 6. Create EventStream + State
+    file_store = LocalFileStore(str(log_dir / "event_store"))
+    event_stream = EventStream(sid="fhe_run", file_store=file_store)
 
+    state = State(max_iterations=args.max_steps)
+    state.history.set_event_stream(event_stream)
+    state.start_id = 0
+    state.history.start_id = 0
+
+    # 7. Add initial user message to event stream
+    initial_msg = MessageAction(content=agent._get_initial_prompt())
+    event_stream.add_event(initial_msg, EventSource.USER)
+
+    # 8. Main loop
     trajectory = []
     best_solution = {"accuracy": 0.0, "code": "", "step": -1}
     start_time = time.time()
@@ -616,42 +420,43 @@ def main():
 
     for step in range(args.max_steps):
         step_start = time.time()
+        state.iteration = step
         logger.info(f"=== Step {step}/{args.max_steps} ===")
 
-        # Call LLM
+        # Agent generates code via LLM
         try:
-            response = llm_call(
-                messages=messages,
-                model=args.model,
-                api_key=api_key,
-                base_url=args.base_url,
-                temperature=args.temperature,
-            )
+            action = agent.step(state)
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            logger.error(f"Agent step failed: {e}")
             trajectory.append({"step": step, "error": str(e), "timestamp": time.time()})
-            # Add error to conversation so LLM sees it
-            messages.append({"role": "assistant", "content": f"[Error: {e}]"})
-            messages.append({"role": "user", "content": "The previous call failed. Please try again with a valid implementation."})
+            error_msg = MessageAction(content=f"[Error: {e}] The previous call failed. Please try again.")
+            event_stream.add_event(error_msg, EventSource.USER)
             continue
 
-        if not response or not response.strip():
-            logger.warning("Empty LLM response")
+        if isinstance(action, AgentFinishAction):
+            logger.info(f"Agent finished: {action.thought}")
+            trajectory.append({"step": step, "finished": True, "thought": action.thought, "timestamp": time.time()})
+            break
+
+        # Add agent response to event stream
+        event_stream.add_event(action, EventSource.AGENT)
+
+        if not isinstance(action, MessageAction) or not action.content.strip():
+            logger.warning("Empty or non-message action from agent")
+            feedback = MessageAction(content="No response received. Please provide a code implementation.")
+            event_stream.add_event(feedback, EventSource.USER)
             continue
 
-        # Extract code
-        code = extract_code_from_response(response)
+        # Extract code from MessageAction
+        code = extract_code_from_response(action.content)
         if not code:
-            logger.warning("No code found in LLM response")
-            messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": "ERROR: No code block found. Please wrap your code in ```cpp ... ```"})
+            logger.warning("No code found in agent response")
+            feedback = MessageAction(content="ERROR: No code block found. Please wrap your code in ```cpp ... ```")
+            event_stream.add_event(feedback, EventSource.USER)
             trajectory.append({"step": step, "error": "no_code_extracted", "timestamp": time.time()})
             continue
 
-        # Add to conversation
-        messages.append({"role": "assistant", "content": response})
-
-        # Execute
+        # Execute via interpreter
         logger.info(f"Executing code ({len(code)} chars)...")
         result = run_on_testcases(interpreter, code, spec.testcase_dirs)
 
@@ -668,11 +473,13 @@ def main():
             save_best_solution(log_dir, best_solution)
             logger.info(f"New best: accuracy={result.accuracy:.4f} (step {step})")
 
-        # Feedback
-        feedback = result.get_feedback()
+        # Feed back result as user message via EventStream
+        feedback_text = result.get_feedback()
         remaining = args.max_steps - step - 1
-        feedback_msg = f"Execution result:\n{feedback}\n\n[Remaining attempts: {remaining}] Please provide an improved implementation."
-        messages.append({"role": "user", "content": feedback_msg})
+        feedback_msg = MessageAction(
+            content=f"Execution result:\n{feedback_text}\n\n[Remaining attempts: {remaining}] Please provide an improved implementation."
+        )
+        event_stream.add_event(feedback_msg, EventSource.USER)
 
         # Log
         step_info = {
@@ -682,13 +489,13 @@ def main():
             "build_success": result.build_success,
             "run_success": result.run_success,
             "accuracy": result.accuracy,
-            "feedback": feedback[:200],
+            "feedback": feedback_text[:200],
             "exec_time": time.time() - step_start,
             "is_best": is_best,
         }
         trajectory.append(step_info)
 
-        save_step(log_dir, step, code, result, feedback)
+        save_step(log_dir, step, code, result, feedback_text)
         save_trajectory(log_dir, trajectory, metadata)
 
         acc_str = f"{result.accuracy:.4f}" if result.accuracy is not None else "N/A"
@@ -702,7 +509,7 @@ def main():
             logger.info(f"Early stop: accuracy {result.accuracy:.4f} >= {args.early_stop}")
             break
 
-    # 7. Final output
+    # 9. Final output
     end_time = time.time()
     metadata["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -724,6 +531,17 @@ def main():
         "summary": summary,
         "best_solution": {k: v for k, v in best_solution.items() if k != "code"},
     }, indent=2, default=str))
+
+    # Save LLM metrics
+    try:
+        llm_metrics = {
+            "model": args.model,
+            "accumulated_cost": llm.metrics.accumulated_cost if hasattr(llm.metrics, 'accumulated_cost') else None,
+            "total_tokens": getattr(llm.metrics, 'total_tokens', None),
+        }
+        (log_dir / "llm_metrics.json").write_text(json.dumps(llm_metrics, indent=2, default=str))
+    except Exception:
+        pass
 
     print("\n" + "=" * 60)
     print("FHE Challenge Run Complete")

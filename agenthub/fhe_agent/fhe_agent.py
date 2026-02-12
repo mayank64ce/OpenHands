@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from openhands.controller.agent import Agent
 from openhands.events.action import MessageAction, AgentFinishAction
+from openhands.events.event import EventSource
 from openhands.llm.llm import LLM
 from openhands.runtime.plugins import PluginRequirement
 
@@ -230,45 +231,28 @@ class FHEAgent(Agent):
 
         Structure:
         - System message with challenge context
-        - History of previous attempts and feedback
-        - Current request
+        - History of previous attempts and feedback (from EventStream)
         """
         messages = [
             {"role": "system", "content": self._get_system_prompt()},
         ]
 
-        # Build conversation from state history
+        # Build conversation from state history (EventStream-backed)
         has_history = False
         if state and hasattr(state, 'history'):
             for event in state.history.get_events():
-                from openhands.events.action import MessageAction as MA
-                from openhands.events.observation import (
-                    CmdOutputObservation,
-                    ErrorObservation,
-                )
-
-                if isinstance(event, MA):
-                    # Agent's previous response
-                    if hasattr(event, '_source') and event._source == 'agent':
+                if isinstance(event, MessageAction):
+                    if event.source == EventSource.AGENT:
                         messages.append({"role": "assistant", "content": event.content})
                     else:
-                        # User/system feedback
                         messages.append({"role": "user", "content": event.content})
                     has_history = True
 
-        # If no history, add initial request
+        # If no history yet, add the initial request
         if not has_history:
             messages.append({
                 "role": "user",
                 "content": self._get_initial_prompt(),
-            })
-
-        # Add remaining turns reminder
-        remaining = state.max_iterations - state.iteration if state else "unknown"
-        if has_history:
-            messages.append({
-                "role": "user",
-                "content": f"[Remaining attempts: {remaining}] Please provide an improved implementation.",
             })
 
         return messages

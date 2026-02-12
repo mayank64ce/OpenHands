@@ -634,6 +634,9 @@ class BaseInterpreter(ABC):
         """
         Build a Docker image.
 
+        Retries with --no-cache if the first attempt fails due to
+        apt/GPG signature errors (stale Docker build cache).
+
         Args:
             dockerfile: Path to Dockerfile
             context: Build context directory
@@ -647,13 +650,15 @@ class BaseInterpreter(ABC):
             env = os.environ.copy()
             env["DOCKER_BUILDKIT"] = "0"
 
+            cmd = [
+                "docker", "build",
+                "-f", str(dockerfile),
+                "-t", tag,
+                str(context),
+            ]
+
             result = subprocess.run(
-                [
-                    "docker", "build",
-                    "-f", str(dockerfile),
-                    "-t", tag,
-                    str(context),
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -661,6 +666,35 @@ class BaseInterpreter(ABC):
             )
 
             output = (result.stdout + "\n" + result.stderr).strip().split("\n")
+
+            if result.returncode != 0:
+                combined = "\n".join(output).lower()
+                # Detect stale cache: apt GPG/signature errors or repo fetch failures
+                apt_cache_errors = [
+                    "invalid signature",
+                    "is not signed",
+                    "gpg error",
+                    "failed to fetch",
+                    "hash sum mismatch",
+                    "temporary failure resolving",
+                ]
+                if any(err in combined for err in apt_cache_errors):
+                    logger.warning("Docker build failed due to apt cache issue, retrying with --no-cache")
+                    cmd_nocache = [
+                        "docker", "build", "--no-cache",
+                        "-f", str(dockerfile),
+                        "-t", tag,
+                        str(context),
+                    ]
+                    result = subprocess.run(
+                        cmd_nocache,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        env=env,
+                    )
+                    output = (result.stdout + "\n" + result.stderr).strip().split("\n")
+
             return result.returncode == 0, output
 
         except subprocess.TimeoutExpired:

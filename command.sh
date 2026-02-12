@@ -6,5 +6,5 @@
 python run_fhe.py \
     --model gpt-4o \
     --challenge-dir ../fhe_challenge/black_box/challenge_relu \
-    --max-steps 10 \
+    --max-steps 5 \
     --log-dir logs/test_relu
