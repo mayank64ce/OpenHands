@@ -400,7 +400,19 @@ def main():
     state.history.start_id = 0
 
     # 7. Add initial user message to event stream
-    initial_msg = MessageAction(content=agent._get_initial_prompt())
+    # The system prompt and initial user prompt come from templates via PromptManager.
+    # This event stream message is the actual task trigger.
+    task_desc = spec.task or "unknown"
+    scheme = spec.scheme.value if spec.scheme else "CKKS"
+    depth = spec.constraints.depth if spec.constraints else "N/A"
+    initial_msg = MessageAction(
+        content=(
+            f"Implement the eval() function body for the '{task_desc}' FHE challenge "
+            f"using the {scheme} encryption scheme.\n"
+            f"Multiplicative depth budget: {depth}\n"
+            f"Wrap your code in <submit_code>...</submit_code> tags."
+        )
+    )
     event_stream.add_event(initial_msg, EventSource.USER)
 
     # 8. Main loop
@@ -438,20 +450,26 @@ def main():
             trajectory.append({"step": step, "finished": True, "thought": action.thought, "timestamp": time.time()})
             break
 
+        # Log agent's thought if present
+        if isinstance(action, MessageAction) and action.thought:
+            logger.info(f"THOUGHT: {action.thought[:500]}")
+
         # Add agent response to event stream
         event_stream.add_event(action, EventSource.AGENT)
 
         if not isinstance(action, MessageAction) or not action.content.strip():
             logger.warning("Empty or non-message action from agent")
-            feedback = MessageAction(content="No response received. Please provide a code implementation.")
+            feedback = MessageAction(content="No response received. Please provide a code implementation wrapped in <submit_code> tags.")
             event_stream.add_event(feedback, EventSource.USER)
             continue
 
         # Extract code from MessageAction
+        # With the new parser, action.content already contains the code from <submit_code> tags.
+        # extract_code_from_response handles both raw code and legacy ```cpp blocks.
         code = extract_code_from_response(action.content)
         if not code:
             logger.warning("No code found in agent response")
-            feedback = MessageAction(content="ERROR: No code block found. Please wrap your code in ```cpp ... ```")
+            feedback = MessageAction(content="ERROR: No code block found. Please wrap your code in <submit_code>...</submit_code> tags.")
             event_stream.add_event(feedback, EventSource.USER)
             trajectory.append({"step": step, "error": "no_code_extracted", "timestamp": time.time()})
             continue
@@ -482,9 +500,11 @@ def main():
         event_stream.add_event(feedback_msg, EventSource.USER)
 
         # Log
+        thought = action.thought if isinstance(action, MessageAction) else ""
         step_info = {
             "step": step,
             "timestamp": time.time(),
+            "thought": thought[:500] if thought else "",
             "code": code[:500] + "..." if len(code) > 500 else code,
             "build_success": result.build_success,
             "run_success": result.run_success,
