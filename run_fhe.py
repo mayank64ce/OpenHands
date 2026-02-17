@@ -25,11 +25,14 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+import coolname
 
 # Add OpenHands to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -85,6 +88,38 @@ def parse_args():
                         help="Stop when accuracy reaches this threshold")
 
     return parser.parse_args()
+
+
+# ============================================================
+# Run naming
+# ============================================================
+
+def _get_next_logindex(dir_path: Path) -> int:
+    """Get the next consecutive index from existing log directories.
+
+    Scans for directories matching the pattern '{index}-{name}' and returns
+    the next available index.
+    """
+    if not dir_path.exists():
+        return 0
+    max_index = -1
+    for child in dir_path.iterdir():
+        if child.is_dir():
+            match = re.match(r'^(\d+)-', child.name)
+            if match:
+                max_index = max(max_index, int(match.group(1)))
+    return max_index + 1
+
+
+def generate_run_name(log_parent: Path) -> str:
+    """Generate a unique run name like '0-ancient-bitter-olive'.
+
+    Uses coolname for a memorable random slug, prefixed with a consecutive
+    index to preserve ordering (same approach as AIDE-FHE).
+    """
+    idx = _get_next_logindex(log_parent)
+    slug = coolname.generate_slug(3)
+    return f"{idx}-{slug}"
 
 
 # ============================================================
@@ -314,12 +349,15 @@ def main():
 
     # 2. Setup workspace
     challenge_name = spec.challenge_dir.name if spec.challenge_dir else "unknown"
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     if args.log_dir:
-        log_dir = Path(args.log_dir)
+        log_parent = Path(args.log_dir)
     else:
-        log_dir = Path("logs/fhe") / f"{challenge_name}_{timestamp}"
+        log_parent = Path("logs/fhe") / challenge_name
+
+    log_parent.mkdir(parents=True, exist_ok=True)
+    run_name = generate_run_name(log_parent)
+    log_dir = log_parent / run_name
 
     log_dir.mkdir(parents=True, exist_ok=True)
     workspace = log_dir / "workspace"
