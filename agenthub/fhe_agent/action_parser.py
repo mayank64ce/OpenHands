@@ -36,6 +36,11 @@ class FHEResponseParser(ResponseParser):
         # Auto-close unclosed submit_code tag (LLM stopped at stop token)
         if '<submit_code>' in action and '</submit_code>' not in action:
             action += '</submit_code>'
+        # Truncate after </submit_code> — simulates stop sequence for models
+        # that don't support the stop parameter (e.g. gpt-5-mini)
+        end_tag = '</submit_code>'
+        if end_tag in action:
+            action = action[:action.index(end_tag) + len(end_tag)]
         return action
 
     def parse_action(self, action_str: str) -> Action:

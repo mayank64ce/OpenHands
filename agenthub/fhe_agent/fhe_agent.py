@@ -240,11 +240,13 @@ class FHEAgent(Agent):
 
         messages = self._get_messages(state)
 
-        params = {
+        params: dict = {
             'messages': [message.model_dump() for message in messages],
-            'stop': ['</submit_code>'],
-            'temperature': 0.0,
         }
+        if self.llm.supports_temperature:
+            params['temperature'] = 0.0
+        if self.llm.supports_stop_sequences:
+            params['stop'] = ['</submit_code>']
 
         if self.llm.supports_prompt_caching:
             params['extra_headers'] = {

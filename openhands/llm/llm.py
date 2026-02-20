@@ -40,6 +40,17 @@ cache_prompting_supported_models = [
     'claude-3-haiku-20240307',
 ]
 
+# Models that require 'max_completion_tokens' instead of 'max_tokens'
+# OpenAI o-series reasoning models and gpt-5+ use this parameter
+_MAX_COMPLETION_TOKENS_PREFIXES = ('o1', 'o3', 'o4', 'gpt-5')
+
+
+def _uses_max_completion_tokens(model_name: str) -> bool:
+    """Return True if the model requires max_completion_tokens instead of max_tokens."""
+    # Strip provider prefix (e.g. 'openai/gpt-5-mini' -> 'gpt-5-mini')
+    name = model_name.split('/')[-1].lower()
+    return any(name.startswith(prefix) for prefix in _MAX_COMPLETION_TOKENS_PREFIXES)
+
 
 class LLM:
     """The LLM class represents a Language Model instance.
@@ -66,6 +77,10 @@ class LLM:
         self.supports_prompt_caching = (
             self.config.model in cache_prompting_supported_models
         )
+        # o-series and gpt-5+ models reject 'stop' sequences and custom temperature
+        _restricted_model = _uses_max_completion_tokens(self.config.model)
+        self.supports_stop_sequences = not _restricted_model
+        self.supports_temperature = not _restricted_model
 
         # Set up config attributes with default values to prevent AttributeError
         LLMConfig.set_missing_attributes(self.config)
@@ -109,6 +124,17 @@ class LLM:
         if self.config.drop_params:
             litellm.drop_params = self.config.drop_params
 
+        _restricted = _uses_max_completion_tokens(self.config.model)
+        _tokens_kwarg = (
+            {'max_completion_tokens': self.config.max_output_tokens}
+            if _restricted
+            else {'max_tokens': self.config.max_output_tokens}
+        )
+        _sampling_kwargs = (
+            {}
+            if _restricted
+            else {'temperature': self.config.temperature, 'top_p': self.config.top_p}
+        )
         self._completion = partial(
             litellm_completion,
             model=self.config.model,
@@ -116,10 +142,9 @@ class LLM:
             base_url=self.config.base_url,
             api_version=self.config.api_version,
             custom_llm_provider=self.config.custom_llm_provider,
-            max_tokens=self.config.max_output_tokens,
             timeout=self.config.timeout,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
+            **_sampling_kwargs,
+            **_tokens_kwarg,
         )
 
         completion_unwrapped = self._completion
@@ -210,11 +235,10 @@ class LLM:
             base_url=self.config.base_url,
             api_version=self.config.api_version,
             custom_llm_provider=self.config.custom_llm_provider,
-            max_tokens=self.config.max_output_tokens,
             timeout=self.config.timeout,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
             drop_params=True,
+            **_sampling_kwargs,
+            **_tokens_kwarg,
         )
 
         async_completion_unwrapped = self._async_completion
